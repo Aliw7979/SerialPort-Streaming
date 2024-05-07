@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use serialport::SerialPort;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -7,6 +8,10 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
+use std::io::Write;
+use std::{io, thread};
+use std::time::Duration;
+
 
 static NEXT_USERID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
@@ -69,14 +74,58 @@ async fn connect(ws: WebSocket, users: Users) {
     let rx = UnboundedReceiverStream::new(rx);
 
     tokio::spawn(rx.forward(user_tx));
-    users.write().await.insert(my_id, tx);
-
-    // Reading and broadcasting messages
+    users.write().await.insert(my_id, tx.clone());
+            let mut port = match serialport::new("/dev/ttyUSB0", 115200)
+            .timeout(std::time::Duration::from_secs(5))
+            .open()
+        {
+            Ok(port) => port,
+        Err(err) => panic!("Failed to open serial port: {}", err),
+    };
+    
+    let mut clone = port.try_clone().expect("Failed to clone");
+    let mut serial_buf: Vec<u8> = vec![0; 100];
+    
+    thread::spawn(move ||
+        loop {
+            match clone.read(serial_buf.as_mut_slice()) {
+                Ok(bytes_read) => {
+                    let received_string = String::from_utf8_lossy(&serial_buf[..bytes_read]).to_string();
+                    println!("Received: {:?}", received_string);
+                    tx.send(Ok(Message::text(received_string).clone())).expect("Failed to send message");
+                    
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
+                Err(e) => eprintln!("{:?}", e),
+            }
+            thread::sleep(Duration::from_millis(1000));
+        }
+    );
+    
     while let Some(result) = user_rx.next().await {
-        broadcast_msg(result.expect("Failed to fetch message"), &users).await;
-    }
 
-    // Disconnect
+        match String::from_utf8(<Message as Clone>::clone(&result.as_ref().expect("failed to fetch message.")).into_bytes()) {
+            Ok(text) => {
+                let byt = result.as_ref().expect("sherover").to_str().unwrap().as_bytes();
+
+                let newline = [13, 10]; 
+        
+                let mut new_data = Vec::from(byt); 
+                new_data.insert(0, 36); 
+                new_data.extend(newline.iter()); 
+                let new_slice = &new_data[..];        
+                println!("{}", text);
+                if let Err(err) = port.write_all(new_slice) {
+                    panic!("Failed to write data to serial port: {}", err);
+                }
+            },
+            Err(err) => {
+                eprintln!("Error converting bytes to string: {}", err);
+            }
+        }
+    }
+    
+
     disconnect(my_id, &users).await;
 }
 
@@ -85,6 +134,11 @@ async fn broadcast_msg(msg: Message, users: &Users) {
         for (&_uid, tx) in users.read().await.iter() {
             tx.send(Ok(msg.clone())).expect("Failed to send message");
         }
+    }
+}
+async fn send_data_to_serial_port_and_get_response(msg: Message,port: &mut Box<dyn SerialPort>) {    
+    if let Err(err) = port.write_all(&msg.as_bytes()) {
+        panic!("Failed to write data to serial port: {}", err);
     }
 }
 
