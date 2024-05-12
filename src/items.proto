@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package items;
+
+message Information {
+    string command = 1;
+    string serial_number = 2;
+    string extended_data_1 = 3;
+    string extended_data_2 = 4;
+    string extended_data_3 = 5;
+    string subscription_expire_date = 6;
+    string configuration_code = 7;
+    string firmware_version_number = 8;
+}
