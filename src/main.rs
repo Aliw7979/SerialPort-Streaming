@@ -142,36 +142,105 @@ async fn connect(ws: WebSocket, users: Users, port: Arc<SerialPort>,last_command
     // Establishing a connection
     let (user_tx, mut user_rx) = ws.split();
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut last_message = String::new();
     let rx = UnboundedReceiverStream::new(rx);
 
     tokio::spawn(rx.forward(user_tx));
     users.write().await.insert(my_id, tx.clone());
          
+    let clone: Arc<SerialPort> = Arc::clone(&port);
     
-    let clone: Arc<SerialPort> = port.clone();
-
-    let mut serial_buf: Vec<u8> = vec![0; 100];
-    let last = last_command.clone();
-    thread::spawn(move ||
+    
+    let last = Arc::clone(&last_command);
+    thread::spawn(move ||{
+        let mut concat_once = false;
+        let mut remained_message = String::new();
         loop {
+            thread::sleep(Duration::from_millis(500));
+            
+            let mut serial_buf: Vec<u8> = vec![0; 512];
             match clone.read(serial_buf.as_mut_slice()) {
                 Ok(bytes_read) => {
-                    let received_string = String::from_utf8_lossy(&serial_buf[..bytes_read]).to_string();
+                    let mut received_string = String::from_utf8_lossy(&serial_buf[..bytes_read]).to_string();
                     println!("Received: {:?}", received_string);
                     // let infoS = InformationStruct::from_text(&received_string);
                     // let info = models::create_info(infoS);
                     // let bin = models::serialize(&info);
-                    let last_temp = last.lock().unwrap().clone();
-                    let res = last_temp.get(&my_id.clone());
+                    let last = last.lock().unwrap();
+                    let res = last.get(&my_id.clone());
                     if let Some(command) = res {
+                        loop{
                         if received_string.contains(command){
+                            if command == &String::from("JI"){
+                                    // Find the starting index of "$>JI"
+                                let start_index = match received_string.find("JI") {
+                                    Some(idx) => idx,
+                                    None => {
+                                        println!("No '$>JI' found in the input string.");
+                                        continue;
+                                    }
+                                };
+                                
+                                // Find the ending index of "\r\n" after the "$>JI"
+                                let end_index = match received_string[start_index..].find("\r\n") {
+                                    Some(idx) => {
+                                        remained_message = received_string[start_index + idx + 2..].to_string();
+                                        start_index + idx + 2 // Add 2 to include "\r\n" in the substring
+                                    }
+                                    None => {
+                                        remained_message = received_string[start_index..].to_string();
+                                        println!("No '\\r\\n' found after '$>JI' in the input string. and remained message set to {}",remained_message);
+                                        break;
+                                    }
+                                };
+                                println!("user {} last command is {}",my_id,command);
+                                tx.send(Ok(Message::text(&mut received_string[start_index..end_index]).clone())).expect("Failed to send message");
+                                concat_once = false;
+                                break;
+                            }
+                            if command == &String::from("GPGGA"){
+                                // Find the starting index of "$>JI"
+                            let start_index = match received_string.find("GPGGA") {
+                                Some(idx) => idx,
+                                None => {
+                                    println!("No '$>GPGGA' found in the input string.");
+                                    continue;
+                                }
+                            };
+                            
+                            // Find the ending index of "\r\n" after the "$>JI"
+                            let end_index = match received_string[start_index..].find("\r\n") {
+                                Some(idx) => {
+                                    remained_message = received_string[start_index + idx + 2..].to_string();
+                                    start_index + idx + 2 // Add 2 to include "\r\n" in the substring
+                                    
+                                }                                None => {
+                                    remained_message = received_string[start_index..].to_string();
+                                    println!("No '\\r\\n' found after '$>JI' in the input string. and remained message set to {}",remained_message);
+                                    break;
+                                }
+                            };
                             println!("user {} last command is {}",my_id,command);
-                            tx.send(Ok(Message::text(received_string).clone())).expect("Failed to send message");
+
+                            tx.send(Ok(Message::text(&mut received_string[start_index..end_index]).clone())).expect("Failed to send message");
+                            concat_once = false;
+                            break;
+
                         }
-                        else if *command == String::from("All") {
-                            tx.send(Ok(Message::text(received_string).clone())).expect("Failed to send message");
                         }
+                        else if concat_once == false && !remained_message.is_empty(){
+                            received_string = remained_message.clone() + &received_string;
+                            println!("the remained message is {} and the new messsage is {}", remained_message, received_string);
+                            concat_once = true;
+                        }
+                        else if remained_message.is_empty(){
+                            remained_message = received_string.clone();
+                            println!("the remained message is {} and the new messsage is {}", remained_message, received_string);
+                            break;
+                        }
+                        else{
+                            break;
+                        }
+                    }
                     } else {
                         println!("Key not found in the map");
                       }
@@ -183,8 +252,8 @@ async fn connect(ws: WebSocket, users: Users, port: Arc<SerialPort>,last_command
                 Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
                 Err(e) => eprintln!("{:?}", e),
             }
-            thread::sleep(Duration::from_millis(1000));
         }
+    }
     );
     
     while let Some(result) = user_rx.next().await {
@@ -204,18 +273,15 @@ async fn connect(ws: WebSocket, users: Users, port: Arc<SerialPort>,last_command
                 if text.contains("JI")
                 {
                     last_command.clone().lock().unwrap().insert(my_id, String::from("JI"));
-                    println!("heshhhh");
                     for (key, value) in last_command.clone().lock().unwrap().iter() {
-                        println!("uuuuuuuuuuuuuuuuuuuuuu Key: {}, Value: {}", key, value);
+                        println!(" Key: {}, Value: {}", key, value);
                       }
                 }
                 if text.contains("JASC")
                 {
                     last_command.clone().lock().unwrap().insert(my_id, String::from("GPGGA"));
                 }
-                else{
-                    last_command.clone().lock().unwrap().insert(my_id, String::from("All"));
-                }
+                
             },
             Err(err) => {
                 eprintln!("Error converting bytes to string: {}", err);
