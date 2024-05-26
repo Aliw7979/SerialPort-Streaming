@@ -4,19 +4,20 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::RwLock;
 use std::sync::Arc;
-use serialport;
+use serialport::{self, new};
 use websocket::ws::dataframe::DataFrame;
 use std::{io, thread};
-extern crate env_logger;
-extern crate ws;
-type Buff = Arc<RwLock<String>>;
+// extern crate env_logger;
+// extern crate ws;
 use chrono::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::io::Result as res;
+use std::fs::File;
 use websocket::sync::Server;
 use websocket::OwnedMessage;
 
+type Buff = Arc<RwLock<String>>;
+type FormDataShare = Arc<RwLock<FormData>>;
 #[derive(Debug, Default,Clone)]
 struct FormData {
     running : bool,
@@ -24,12 +25,8 @@ struct FormData {
     file_len : String,
 }
 
-#[derive(Debug, Default, Clone)]
-struct FormDataShare{
-    form : Arc<RwLock<FormData>>,
-}
 
-impl FormDataShare {
+impl FormData {
     // Method to reset the struct to its default state
     fn reset(&mut self) {
         *self = Default::default();
@@ -71,7 +68,7 @@ fn serial_port_access(buffer:Buff){
             Ok(bytes_read) => {
                 let mut writer = buffer.write().unwrap();
                 *writer = String::from_utf8_lossy(&serial_buf[..bytes_read]).to_string();
-                println!("{}",*writer)
+                // println!("{}",*writer)
             }
             Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
                     Err(e) => eprintln!("{:?}", e),
@@ -87,7 +84,7 @@ fn log_creator(file_name : String,path : PathBuf){
         else {
                 println!("Path does not exist: {}", path.display());
             
-                match fs::create_dir(path.clone()) {
+                match fs::create_dir_all(path.clone()) {
                     Ok(_) =>{
                         println!("Directory created successfully");
                     } 
@@ -97,7 +94,7 @@ fn log_creator(file_name : String,path : PathBuf){
         }
         // create file
         let mut path_to_create = path.clone();
-        path_to_create.push("/".to_owned() + file_name.as_str()); // Specify the file path here    
+        path_to_create.push(file_name); // Specify the file path here    
         match fs::File::create(path_to_create) {
         Ok(file) =>{
             file
@@ -109,43 +106,85 @@ fn log_creator(file_name : String,path : PathBuf){
         };
 }
 
+fn string_to_int(string:String,junk : String) -> u32{
+    let mut len = string.replace(&junk, "");
+    len.parse().unwrap()
+}
+
 fn log_writer(form : FormDataShare , buffer : Buff){
     let mut is_init = false;
     let mut file_name = "";
     let mut new_file = true;
+    let mut len_int: u32 = 0;
     let mut decoded_len_number = 0;
     let mut decoded_len_scale = "";
-    while form.form.read().unwrap().running == true{
-        let splited = buffer.read().unwrap();
-        let date = splited.split(",").nth(2).unwrap();
-        let hours = &date[0..2];
-        let minutes = &date[2..4];
-        let seconds = &date[4..6];
-        
-        // Convert to integers
-        let ihours: u32 = hours.parse().unwrap();
-        let iminutes: u32 = minutes.parse().unwrap();
-        let iseconds: u32 = seconds.parse().unwrap();
+    let mut default_path = PathBuf::new();
+    loop {
+        if form.read().unwrap().running == true{
 
-        let datetime = Utc::now();
-        let mut path = PathBuf::new();
-        path.push("log");
-        path.push(datetime.year().to_string());
-        path.push(datetime.month().to_string());
-        path.push(datetime.day().to_string());
-        path.push(form.form.read().unwrap().session_name.clone());
-        
-        if is_init == false{
-            log_creator(date.to_string(), path)
-        }
-        if form.form.read().unwrap().file_len.contains("h"){
-            
-        }
-        else if form.form.read().unwrap().file_len.contains("m"){
-            
-        }
-        else if form.form.read().unwrap().file_len.contains("s"){
-            
+            thread::sleep(std::time::Duration::from_secs(1));
+            let splited = buffer.read().unwrap();
+            let date = splited.split(",").nth(1).unwrap();
+            let hours = &date[0..2];
+            let minutes = &date[2..4];
+            let seconds = &date[4..6];
+            println!("time is {}:{}:{}", hours,minutes,seconds);
+            // Convert to integers
+            let ihours: u32 = hours.parse().unwrap();
+            let iminutes: u32 = minutes.parse().unwrap();
+            let iseconds: u32 = seconds.parse().unwrap();
+    
+            let datetime = Utc::now();
+            let mut path = PathBuf::new();
+            path.push("log");
+            path.push(datetime.year().to_string());
+            path.push(datetime.month().to_string());
+            path.push(datetime.day().to_string());
+            path.push(form.read().unwrap().session_name.clone());
+            path.push(date);        
+            if is_init == false{
+                default_path = path.clone();
+                let mut dirpath = path.clone();
+                dirpath.pop();
+                log_creator(date.to_string(), dirpath);
+                is_init = true;
+            }
+            if form.read().unwrap().file_len.contains("h"){
+                if iseconds == 0 && iminutes == 0 && ihours % len_int == 0{
+                    default_path = path.clone();
+                    let mut dirpath = path.clone();
+                    dirpath.pop();
+                    log_creator(date.to_string(), dirpath);
+                    continue;
+                }
+                len_int = string_to_int(form.read().unwrap().file_len.clone(), String::from("h")); 
+                let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&default_path);
+                write!(file.unwrap(),"{}",buffer.read().unwrap());
+
+                
+        }    
+            else if form.read().unwrap().file_len.contains("m"){
+                if iseconds == 0 && iminutes % len_int == 0{
+                    default_path = path.clone();
+                    let mut dirpath = path.clone();
+                    dirpath.pop();
+                    println!("creating file {} at {}",date.to_string(),dirpath.to_str().unwrap());
+                    log_creator(date.to_string(), dirpath);
+                }
+                len_int = string_to_int(form.read().unwrap().file_len.clone(), String::from("m")); 
+                let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&default_path);
+                write!(file.unwrap(),"{}",buffer.read().unwrap());
+            }
+            // else if form.form.read().unwrap().file_len.contains("s"){
+            //     let mut len_int : i32 = string_to_int(form.form.read().unwrap().file_len.clone(), String::from("s")); 
+    
+            // }
         }
 
 
@@ -177,7 +216,6 @@ fn websocket_command(buffer : Buff ){
 	for request in server.filter_map(Result::ok) {
         // Spawn a new thread for each connection.
 		let command = FormDataShare::default();
-        let mut form = command.clone();
         let buffer_to_read = buffer.clone();
 		thread::spawn(move|| {
 			if !request.protocols().contains(&"rust-websocket".to_string()) {
@@ -195,12 +233,12 @@ fn websocket_command(buffer : Buff ){
 			client.send_message(&message).unwrap();
 
 			let (mut receiver, mut sender) = client.split().unwrap();
-            let form_to_read = form.clone();
+            let form_to_read = command.clone();
             thread::spawn(move||log_writer(form_to_read, buffer_to_read));
 
 			for message in receiver.incoming_messages() {
 				let message = message.unwrap();
-
+                let form = command.clone();
 				match message {
 					OwnedMessage::Close(_) => {
 						let message = OwnedMessage::Close(None);
@@ -216,32 +254,45 @@ fn websocket_command(buffer : Buff ){
                         sender.send_message(&message).unwrap();
                         let msg = String::from_utf8(message.take_payload()).unwrap();
                         if msg.contains("log-on"){
-                            if form.form.read().unwrap().running == true{
+                            if form.read().unwrap().running == true{
                                 sender.send_message(&OwnedMessage::Text(String::from("logging is already on!"))).unwrap();
                             }
                             else{
-                                form.reset();
-                                let fill_form = form.form.read().unwrap();
+                                let mut form_to_reset = form.write().unwrap();
+                                form_to_reset.reset();
+                                drop(form_to_reset);
+                                
                                 let splited = msg.split(" ").skip(1);
                                 for sp in splited{
-                                    if fill_form.session_name == ""{
-                                    let mut write_on_form = form.form.write().unwrap();
-                                    write_on_form.session_name = sp.to_string();
-                                    }
-                                    if fill_form.file_len == ""{
-                                    let mut write_on_form = form.form.write().unwrap();
-                                    write_on_form.file_len = sp.to_string();
-                                    }
+                                    println!("command from user is {}", sp);
+                                    
+                                        if form.read().unwrap().session_name.is_empty(){
+                                            let mut write_on_form = form.write().unwrap();
+                                            write_on_form.session_name = sp.to_string();
+                                            
+                                            
+                                        }
+                                    
+                                    
+                                        
+                                        else if form.read().unwrap().file_len.is_empty(){
+                                            let mut write_on_form = form.write().unwrap();
+                                            write_on_form.file_len = sp.to_string();
+                                            
+                                        }
+                                    
+                                    println!("command from user after collect is {}", sp);
                                 }
-                                let mut write_on_form = form.form.write().unwrap();
+                                let mut write_on_form = form.write().unwrap();
                                 write_on_form.running = true;
                                 println!("{}","log is on from now.");
                                 
                             }
 
                         }
+
                         if msg == String::from("log-off"){
-                            let mut write_on_form = form.form.write().unwrap();
+                            let mut write_on_form = form.write().unwrap();
                             write_on_form.running = false;
                             println!("{}","log is off from now.");
                         }
@@ -252,7 +303,7 @@ fn websocket_command(buffer : Buff ){
                             path.push(datetime.year().to_string());
                             path.push(datetime.month().to_string());
                             path.push(datetime.day().to_string());
-                            path.push(form.form.read().unwrap().session_name.clone());
+                            path.push(form.read().unwrap().session_name.clone());
                             if path.exists() {
                                 println!("Path exists: {}", path.display());
                                 match get_directory_size(&path) {
