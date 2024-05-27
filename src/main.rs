@@ -1,57 +1,245 @@
-extern crate websocket;
-// Importing necessary modules from the Rust libraries
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+#![allow(non_snake_case)]
+use std::fs::File;
+
+use std::clone;
+use std::io::Read;
 use std::sync::RwLock;
 use std::sync::Arc;
-use serialport::{self, new};
-use websocket::ws::dataframe::DataFrame;
+use std::time::Duration;
+use serialport::{self};
 use std::{io, thread};
-// extern crate env_logger;
-// extern crate ws;
-use chrono::prelude::*;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::fs::File;
-use websocket::sync::Server;
-use websocket::OwnedMessage;
+use std::io::Cursor;
+use byteorder::{LittleEndian, ReadBytesExt};
+use std::fmt;
+type Buff = Arc<RwLock<Vec<u8>>>;
+use serde::Serialize;
+use std::io::Write;
 
-type Buff = Arc<RwLock<String>>;
-type FormDataShare = Arc<RwLock<FormData>>;
-#[derive(Debug, Default,Clone)]
-struct FormData {
-    running : bool,
-    session_name: String,
-    file_len : String,
+#[repr(C)]
+#[derive(Copy, Clone, Serialize)]
+struct SBinaryMsgHeader {
+    m_strSOH: [u8; 4],
+    m_byBlockID: u16,
+    m_wDataLength: u16,
 }
 
-
-impl FormData {
-    // Method to reset the struct to its default state
-    fn reset(&mut self) {
-        *self = Default::default();
+impl fmt::Debug for SBinaryMsgHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SBinaryMsgHeader {{ m_strSOH: {:?}, m_byBlockID: {:?}, m_wDataLength: {:?} }}",
+            std::str::from_utf8(&self.m_strSOH).unwrap_or("Invalid UTF-8"),
+            self.m_byBlockID,
+            self.m_wDataLength
+        )
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Serialize)]
+struct SBinaryMsgHeaderDW {
+    ulDwordPreamble: u32,
+    ulDwordInfo: u32,
+}
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+union SUnionMsgHeader {
+    sBytes: SBinaryMsgHeader,
+    sDWord: SBinaryMsgHeaderDW,
+}
 
-fn handle_client(mut stream: TcpStream,buffer : Buff){
-    // this is a buffer to read data from the client
-    // let mut buffer = [0; 1024];
-    // this line reads data from the stream and stores it in the buffer.
-    // stream.read(&mut buffer).expect("Failed to read from client!");
-    // this line converts the data in the buffer into a UTF-8 enccoded string.
-    // let request = String::from_utf8_lossy(&buffer[..]);
-    // println!("Received request: {}", request);
-    loop{
-        thread::sleep(std::time::Duration::from_secs(1));
-
-        let buff_to_read = buffer.read().unwrap();
-        stream.write(buff_to_read.as_bytes()).expect("Failed to write response!");
-
+impl fmt::Debug for SUnionMsgHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        unsafe {
+            if std::str::from_utf8(&self.sBytes.m_strSOH).unwrap_or("") == "$BIN" {
+                write!(f, "SUnionMsgHeader {{ sBytes: {:?} }}", self.sBytes)
+            } else {
+                write!(f, "SUnionMsgHeader {{ sDWord: {:?} }}", self.sDWord)
+            }
+        }
     }
+}
+
+// Manual implementation of Serialize for the union
+impl Serialize for SUnionMsgHeader {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        unsafe {
+            if std::str::from_utf8(&self.sBytes.m_strSOH).unwrap_or("") == "$BIN" {
+                self.sBytes.serialize(serializer)
+            } else {
+                self.sDWord.serialize(serializer)
+            }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Serialize)]
+struct SSVSNRData309 {
+    m_wSYS_PRNID: u16,
+    m_wStatus: u16,
+    m_chElev: i8,
+    m_byAzimuth: u8,
+    m_wLower2BitsSNR7_6_5_4_3_2_1_0: u16,
+    m_abySNR8Bits: [u8; 8],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Serialize)]
+struct SBinaryMsg309 {
+    m_sHead: SUnionMsgHeader,
+    m_dGPSTimeOfWeek: f64,
+    m_wGPSWeek: u16,
+    m_cUTCTimeDiff: i8,
+    m_byPage: u8,
+    m_asSVData309: [SSVSNRData309; 30],
+    m_wCheckSum: u16,
+    m_wCRLF: u16,
+}
+
+
+fn parse_sbinary_msg_header(cursor: &mut std::io::Cursor<Vec<u8>>) -> io::Result<SBinaryMsgHeader> {
+    let mut m_strSOH = [0u8; 4];
+    cursor.read_exact(&mut m_strSOH)?;
+    let m_byBlockID = cursor.read_u16::<LittleEndian>()?;
+    let m_wDataLength = cursor.read_u16::<LittleEndian>()?;
+    Ok(SBinaryMsgHeader {
+        m_strSOH,
+        m_byBlockID,
+        m_wDataLength,
+    })
+}
+
+fn parse_sbinary_msg_headerdw(cursor: &mut std::io::Cursor<Vec<u8>>) -> io::Result<SBinaryMsgHeaderDW> {
+    let ulDwordPreamble = cursor.read_u32::<LittleEndian>()?;
+    let ulDwordInfo = cursor.read_u32::<LittleEndian>()?;
+    Ok(SBinaryMsgHeaderDW {
+        ulDwordPreamble,
+        ulDwordInfo,
+    })
+}
+
+fn parse_ssvsnr_data309(cursor: &mut std::io::Cursor<Vec<u8>>) -> io::Result<SSVSNRData309> {
+    let m_wSYS_PRNID = cursor.read_u16::<LittleEndian>()?;
+    let m_wStatus = cursor.read_u16::<LittleEndian>()?;
+    let m_chElev = cursor.read_i8()?;
+    let m_byAzimuth = cursor.read_u8()?;
+    let m_wLower2BitsSNR7_6_5_4_3_2_1_0 = cursor.read_u16::<LittleEndian>()?;
+    let mut m_abySNR8Bits = [0u8; 8];
+    cursor.read_exact(&mut m_abySNR8Bits)?;
+    Ok(SSVSNRData309 {
+        m_wSYS_PRNID,
+        m_wStatus,
+        m_chElev,
+        m_byAzimuth,
+        m_wLower2BitsSNR7_6_5_4_3_2_1_0,
+        m_abySNR8Bits,
+    })
+}
+
+fn parse_sbinary_msg309(cursor: &mut std::io::Cursor<Vec<u8>>)-> io::Result<SBinaryMsg309> {
+    let m_sHead: SUnionMsgHeader =  {
+        if cursor.get_ref().len() - cursor.position() as usize >= 8 {
+            let pos = cursor.position() as usize;
+            let slice = &cursor.get_ref()[pos..pos + 8];
+            if slice.starts_with(b"$BIN") {
+                SUnionMsgHeader {
+                    sBytes: parse_sbinary_msg_header(cursor)?,
+                }
+            } else {
+                SUnionMsgHeader {
+                    sDWord: parse_sbinary_msg_headerdw(cursor)?,
+                }
+            }
+        } 
+        else {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Not enough data for union"));
+        }
+     
+    };
+
+    let m_dGPSTimeOfWeek = cursor.read_f64::<LittleEndian>()?;
+    let m_wGPSWeek = cursor.read_u16::<LittleEndian>()?;
+    let m_cUTCTimeDiff = cursor.read_i8()?;
+    let m_byPage = cursor.read_u8()?;
+
+    let mut m_asSVData309 = [SSVSNRData309 {
+        m_wSYS_PRNID: 0,
+        m_wStatus: 0,
+        m_chElev: 0,
+        m_byAzimuth: 0,
+        m_wLower2BitsSNR7_6_5_4_3_2_1_0: 0,
+        m_abySNR8Bits: [0u8; 8],
+    }; 30];
     
+    for data in &mut m_asSVData309 {
+        *data = parse_ssvsnr_data309(cursor)?;
+    }
+
+    let m_wCheckSum = cursor.read_u16::<LittleEndian>()?;
+    let m_wCRLF = cursor.read_u16::<LittleEndian>()?;
+    let mut bufbufac : Vec<u8> = vec![0; 1024]; 
+    cursor.read_to_end(&mut bufbufac);
+    // println!("##########################################{:?}#########################",bufbufac);
+    Ok(SBinaryMsg309 {
+        m_sHead,
+        m_dGPSTimeOfWeek,
+        m_wGPSWeek,
+        m_cUTCTimeDiff,
+        m_byPage,
+        m_asSVData309,
+        m_wCheckSum,
+        m_wCRLF,
+    })
 }
+
+fn main() -> io::Result<()> {
+    let buffer:Buff = Buff::default();
+    let buff_to_write = buffer.clone();
+    thread::spawn(move||serial_port_access(buff_to_write));
+    // Sample binary data (must be replaced with actual data)
+    loop {
+        // println!("{:?}",buffer.read().unwrap());
+        thread::sleep(Duration::from_secs(2));
+        let binding = buffer.read().unwrap();
+        // println!("this is the value of binding {:?}", binding);
+        let mut cursor = Cursor::new(binding.to_owned());
+        // let binding = buff_to_deser.read().unwrap();
+        // println!("this is the value of binding {:?}", binding);
+        // let mut cursor = Cursor::new(binding.as_slice());
+        let sbinary_msg = parse_sbinary_msg309(&mut cursor)?;
+        println!("result : {:?}",sbinary_msg);
+        let json = serde_json::to_string_pretty(&sbinary_msg).unwrap();
+        let mut file = File::create("output.json").unwrap();
+        file.write_all(json.as_bytes()).unwrap();
+        println!("##########################################position of iter {:?}#########################",cursor.position());
+        println!("##########################################len of iter {:?}#########################",cursor.get_ref().len());
+
+        // println!("{:?}", );
+    }
+
+}
+
+
+
+
+// fn handle_client(mut stream: TcpStream,buffer : Buff){
+//     // this is a buffer to read data from the client
+//     // let mut buffer = [0; 1024];
+//     // this line reads data from the stream and stores it in the buffer.
+//     loop{
+//         thread::sleep(std::time::Duration::from_secs(1));
+
+//         let buff_to_read = buffer.read().unwrap();
+//         stream.write(buff_to_read.as_bytes()).expect("Failed to write response!");
+
+//     }
+    
+// }
 
 fn serial_port_access(buffer:Buff){
     let mut port = match serialport::new("/dev/ttyUSB0", 115200)
@@ -64,290 +252,52 @@ fn serial_port_access(buffer:Buff){
     let mut serial_buf: Vec<u8> = vec![0; 1024];
     loop {
         thread::sleep(std::time::Duration::from_secs(1));
-        match port.read(serial_buf.as_mut_slice()) {
+        match port.read(&mut serial_buf) {
             Ok(bytes_read) => {
+                
                 let mut writer = buffer.write().unwrap();
-                *writer = String::from_utf8_lossy(&serial_buf[..bytes_read]).to_string();
-                // println!("{}",*writer)
+                // let temp = String::from_utf8_lossy(&serial_buf[..bytes_read]).to_string();
+                let temp = &serial_buf[..bytes_read];
+                let bin_sequence = b"$BIN";
+                let newline_sequence = b"\r\n";
+            
+                // Find the index of the $BIN sequence
+                let bin_index = temp.windows(bin_sequence.len())
+                                    .position(|window| window == bin_sequence);
+            
+                // Find the index of the \r\n sequence
+                let newline_index = temp.windows(newline_sequence.len())
+                                        .position(|window| window == newline_sequence);
+            
+                *writer = temp[bin_index.unwrap()..newline_index.unwrap()+2].to_vec();
+                println!("{:?}",writer);
             }
+            
             Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
                     Err(e) => eprintln!("{:?}", e),
                 };
-    }
-}
-
-fn log_creator(file_name : String,path : PathBuf){
-        //create directory
-        if path.exists() {
-            println!("Path exists log error at address: {}", path.display());
-            }
-        else {
-                println!("Path does not exist: {}", path.display());
-            
-                match fs::create_dir_all(path.clone()) {
-                    Ok(_) =>{
-                        println!("Directory created successfully");
-                    } 
-                    Err(err) => println!("Error creating directory: {}", err),
-                }
-                
-        }
-        // create file
-        let mut path_to_create = path.clone();
-        path_to_create.push(file_name); // Specify the file path here    
-        match fs::File::create(path_to_create) {
-        Ok(file) =>{
-            file
-        }
-        Err(err) => {
-            println!("Error creating file: {}", err);
-            return;
-        }
-        };
-}
-
-fn string_to_int(string:String,junk : String) -> u32{
-    let mut len = string.replace(&junk, "");
-    len.parse().unwrap()
-}
-
-fn log_writer(form : FormDataShare , buffer : Buff){
-    let mut is_init = false;
-    let mut file_name = "";
-    let mut new_file = true;
-    let mut len_int: u32 = 0;
-    let mut decoded_len_number = 0;
-    let mut decoded_len_scale = "";
-    let mut default_path = PathBuf::new();
-    loop {
-        if form.read().unwrap().running == true{
-
-            thread::sleep(std::time::Duration::from_secs(1));
-            let splited = buffer.read().unwrap();
-            let date = splited.split(",").nth(1).unwrap();
-            let hours = &date[0..2];
-            let minutes = &date[2..4];
-            let seconds = &date[4..6];
-            println!("time is {}:{}:{}", hours,minutes,seconds);
-            // Convert to integers
-            let ihours: u32 = hours.parse().unwrap();
-            let iminutes: u32 = minutes.parse().unwrap();
-            let iseconds: u32 = seconds.parse().unwrap();
-    
-            let datetime = Utc::now();
-            let mut path = PathBuf::new();
-            path.push("log");
-            path.push(datetime.year().to_string());
-            path.push(datetime.month().to_string());
-            path.push(datetime.day().to_string());
-            path.push(form.read().unwrap().session_name.clone());
-            path.push(date);        
-            if is_init == false{
-                default_path = path.clone();
-                let mut dirpath = path.clone();
-                dirpath.pop();
-                log_creator(date.to_string(), dirpath);
-                is_init = true;
-            }
-            if form.read().unwrap().file_len.contains("h"){
-                if iseconds == 0 && iminutes == 0 && ihours % len_int == 0{
-                    default_path = path.clone();
-                    let mut dirpath = path.clone();
-                    dirpath.pop();
-                    log_creator(date.to_string(), dirpath);
-                    continue;
-                }
-                len_int = string_to_int(form.read().unwrap().file_len.clone(), String::from("h")); 
-                let file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&default_path);
-                write!(file.unwrap(),"{}",buffer.read().unwrap());
-
-                
-        }    
-            else if form.read().unwrap().file_len.contains("m"){
-                if iseconds == 0 && iminutes % len_int == 0{
-                    default_path = path.clone();
-                    let mut dirpath = path.clone();
-                    dirpath.pop();
-                    println!("creating file {} at {}",date.to_string(),dirpath.to_str().unwrap());
-                    log_creator(date.to_string(), dirpath);
-                }
-                len_int = string_to_int(form.read().unwrap().file_len.clone(), String::from("m")); 
-                let file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&default_path);
-                write!(file.unwrap(),"{}",buffer.read().unwrap());
-            }
-            // else if form.form.read().unwrap().file_len.contains("s"){
-            //     let mut len_int : i32 = string_to_int(form.form.read().unwrap().file_len.clone(), String::from("s")); 
-    
-            // }
-        }
-
-
-    }
-}
-
-fn get_directory_size(path: &Path) -> io::Result<u64> {
-    let mut total_size = 0;
-
-    if path.is_dir() {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                total_size += get_directory_size(&path)?;
-            } else {
-                total_size += entry.metadata()?.len();
             }
         }
-    } else {
-        total_size += path.metadata()?.len();
-    }
+        
 
-    Ok(total_size)
-}
-
-fn websocket_command(buffer : Buff ){
-    let server = Server::bind("127.0.0.1:2794").unwrap();
-	for request in server.filter_map(Result::ok) {
-        // Spawn a new thread for each connection.
-		let command = FormDataShare::default();
-        let buffer_to_read = buffer.clone();
-		thread::spawn(move|| {
-			if !request.protocols().contains(&"rust-websocket".to_string()) {
-				request.reject().unwrap();
-				return;
-			}
-
-			let mut client = request.use_protocol("rust-websocket").accept().unwrap();
-
-			let ip = client.peer_addr().unwrap();
-
-			println!("Connection from {}", ip);
-
-			let message = OwnedMessage::Text("Hello".to_string());
-			client.send_message(&message).unwrap();
-
-			let (mut receiver, mut sender) = client.split().unwrap();
-            let form_to_read = command.clone();
-            thread::spawn(move||log_writer(form_to_read, buffer_to_read));
-
-			for message in receiver.incoming_messages() {
-				let message = message.unwrap();
-                let form = command.clone();
-				match message {
-					OwnedMessage::Close(_) => {
-						let message = OwnedMessage::Close(None);
-						sender.send_message(&message).unwrap();
-						println!("Client {} disconnected", ip);
-						return;
-					}
-					OwnedMessage::Ping(ping) => {
-						let message = OwnedMessage::Pong(ping);
-						sender.send_message(&message).unwrap();
-					}
-					_ => {
-                        sender.send_message(&message).unwrap();
-                        let msg = String::from_utf8(message.take_payload()).unwrap();
-                        if msg.contains("log-on"){
-                            if form.read().unwrap().running == true{
-                                sender.send_message(&OwnedMessage::Text(String::from("logging is already on!"))).unwrap();
-                            }
-                            else{
-                                let mut form_to_reset = form.write().unwrap();
-                                form_to_reset.reset();
-                                drop(form_to_reset);
-                                
-                                let splited = msg.split(" ").skip(1);
-                                for sp in splited{
-                                    println!("command from user is {}", sp);
-                                    
-                                        if form.read().unwrap().session_name.is_empty(){
-                                            let mut write_on_form = form.write().unwrap();
-                                            write_on_form.session_name = sp.to_string();
-                                            
-                                            
-                                        }
-                                    
-                                    
-                                        
-                                        else if form.read().unwrap().file_len.is_empty(){
-                                            let mut write_on_form = form.write().unwrap();
-                                            write_on_form.file_len = sp.to_string();
-                                            
-                                        }
-                                    
-                                    println!("command from user after collect is {}", sp);
-                                }
-                                let mut write_on_form = form.write().unwrap();
-                                write_on_form.running = true;
-                                println!("{}","log is on from now.");
-                                
-                            }
-
-                        }
-
-                        if msg == String::from("log-off"){
-                            let mut write_on_form = form.write().unwrap();
-                            write_on_form.running = false;
-                            println!("{}","log is off from now.");
-                        }
-                        else if msg == String::from("log-stats") {
-                            let datetime = Utc::now();
-                            let mut path = PathBuf::new();
-                            path.push("log");
-                            path.push(datetime.year().to_string());
-                            path.push(datetime.month().to_string());
-                            path.push(datetime.day().to_string());
-                            path.push(form.read().unwrap().session_name.clone());
-                            if path.exists() {
-                                println!("Path exists: {}", path.display());
-                                match get_directory_size(&path) {
-                                    Ok(size) => {
-                                        let size_in_mb = size as f64 / (1024.0 * 1024.0);
-                                        println!("Directory size: {:.2} MB", size_in_mb);
-                                    }
-                                    Err(e) => println!("Failed to calculate directory size: {}", e),
-                                }
-                                } 
-                            else {
-                                    println!("Path does not exist: {}", path.display());
-                                
-                            }
-                            println!("{}","log stats is ");
-                        }
-                    }
-				}
-			}
-		});
-	}
-  
-  
-}
-
-
-fn main(){
-    let listener = TcpListener::bind("127.0.0.1:8080").expect("Failed to bind to address");
-    println!("Server listening on 127.0.0.1:8080");
-    let buffer =  Buff::default();
-    let buff_to_write = buffer.clone();
-    thread::spawn(move||serial_port_access(buff_to_write));
-    let buff_to_read_ws = buffer.clone();
-    thread::spawn(move|| websocket_command(buff_to_read_ws));
-    for stream in listener.incoming(){
-        match stream{
-            Ok(stream) => {
-                let buff_to_read = buffer.clone();
-                thread::spawn(move || handle_client(stream,buff_to_read));
-            }
-            Err(e) => {
-                eprintln!("Failed to establish connection: {}", e);
-            // stderr - standard error stream
-            }
-        }
-    }
-}
+// fn main(){
+//     let listener = TcpListener::bind("127.0.0.1:8080").expect("Failed to bind to address");
+//     println!("Server listening on 127.0.0.1:8080");
+//     let buffer =  Buff::default();
+//     let buff_to_write = buffer.clone();
+//     thread::spawn(move||serial_port_access(buff_to_write));
+//     // let buff_to_read_ws = buffer.clone();
+//     //thread::spawn(move|| websocket_command(buff_to_read_ws));
+//     for stream in listener.incoming(){
+//         match stream{
+//             Ok(stream) => {
+//                 let buff_to_read = buffer.clone();
+//                 thread::spawn(move || handle_client(stream,buff_to_read));
+//             }
+//             Err(e) => {
+//                 eprintln!("Failed to establish connection: {}", e);
+//             // stderr - standard error stream
+//             }
+//         }
+//     }
+// }

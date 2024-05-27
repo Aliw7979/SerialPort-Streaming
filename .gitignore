@@ -1,5 +1,5 @@
 /target
 Cargo.lock
 .vscode/
-
+output.json
 /log/
