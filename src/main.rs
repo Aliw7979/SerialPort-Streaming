@@ -1,7 +1,6 @@
 #![allow(non_snake_case)]
 use std::fs::File;
 
-use std::clone;
 use std::io::Read;
 use std::sync::RwLock;
 use std::sync::Arc;
@@ -183,8 +182,7 @@ fn parse_sbinary_msg309(cursor: &mut std::io::Cursor<Vec<u8>>)-> io::Result<SBin
     let m_wCheckSum = cursor.read_u16::<LittleEndian>()?;
     let m_wCRLF = cursor.read_u16::<LittleEndian>()?;
     let mut bufbufac : Vec<u8> = vec![0; 1024]; 
-    cursor.read_to_end(&mut bufbufac);
-    // println!("##########################################{:?}#########################",bufbufac);
+    let _ = cursor.read_to_end(&mut bufbufac);
     Ok(SBinaryMsg309 {
         m_sHead,
         m_dGPSTimeOfWeek,
@@ -216,30 +214,11 @@ fn main() -> io::Result<()> {
         let json = serde_json::to_string_pretty(&sbinary_msg).unwrap();
         let mut file = File::create("output.json").unwrap();
         file.write_all(json.as_bytes()).unwrap();
-        println!("##########################################position of iter {:?}#########################",cursor.position());
-        println!("##########################################len of iter {:?}#########################",cursor.get_ref().len());
-
-        // println!("{:?}", );
     }
 
 }
 
 
-
-
-// fn handle_client(mut stream: TcpStream,buffer : Buff){
-//     // this is a buffer to read data from the client
-//     // let mut buffer = [0; 1024];
-//     // this line reads data from the stream and stores it in the buffer.
-//     loop{
-//         thread::sleep(std::time::Duration::from_secs(1));
-
-//         let buff_to_read = buffer.read().unwrap();
-//         stream.write(buff_to_read.as_bytes()).expect("Failed to write response!");
-
-//     }
-    
-// }
 
 fn serial_port_access(buffer:Buff){
     let mut port = match serialport::new("/dev/ttyUSB0", 115200)
@@ -279,25 +258,3 @@ fn serial_port_access(buffer:Buff){
             }
         }
         
-
-// fn main(){
-//     let listener = TcpListener::bind("127.0.0.1:8080").expect("Failed to bind to address");
-//     println!("Server listening on 127.0.0.1:8080");
-//     let buffer =  Buff::default();
-//     let buff_to_write = buffer.clone();
-//     thread::spawn(move||serial_port_access(buff_to_write));
-//     // let buff_to_read_ws = buffer.clone();
-//     //thread::spawn(move|| websocket_command(buff_to_read_ws));
-//     for stream in listener.incoming(){
-//         match stream{
-//             Ok(stream) => {
-//                 let buff_to_read = buffer.clone();
-//                 thread::spawn(move || handle_client(stream,buff_to_read));
-//             }
-//             Err(e) => {
-//                 eprintln!("Failed to establish connection: {}", e);
-//             // stderr - standard error stream
-//             }
-//         }
-//     }
-// }
